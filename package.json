@@ -1,0 +1,9 @@
+{
+  "name": "copilot-local-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Small authenticated loopback Responses proxy for Codex and GitHub Copilot.",
+  "engines": { "node": ">=22" },
+  "scripts": { "test": "node --test", "start": "node server.mjs" }
+}

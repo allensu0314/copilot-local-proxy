@@ -1,0 +1,185 @@
+# Local Copilot proxy
+
+A dependency-free Node HTTP service forwarding native OpenAI Responses to
+`https://api.githubcopilot.com`. No VS Code, nested coding agent, protocol
+conversion, or external database is involved. Codex executes its own tools.
+Copilot licensing, model access, organization policies, and usage limits still
+apply. The Copilot endpoint is not a guaranteed public third-party API and may
+change.
+
+## Installed usage
+
+Open the installed **Codex desktop app**, select **Codex** mode, and start a
+**new local chat**. On this app build the window is titled ChatGPT. The desktop
+default provider is **Local GitHub Copilot**; no terminal command, VS Code
+window, or environment variable is needed. Existing chats may retain their
+previous provider. If a new chat retains the old provider, fully quit and reopen
+the app before creating another chat.
+
+The desktop integration backs up `~\.codex\config.toml` under the protected
+`%LOCALAPPDATA%\CopilotProxy` directory. It changes only the top-level default
+provider and disables unsupported hosted web search, then adds a marked
+`model_providers.copilot-local` block. Existing model, reasoning level, tools,
+MCP servers, permissions, and other providers are preserved.
+
+The CLI remains available as an **optional** alternative in a new terminal:
+
+```powershell
+codex-copilot
+codex-copilot exec "Reply exactly CONNECTED. Do not use tools."
+```
+
+In an already-open terminal, use:
+
+```powershell
+& "$env:LOCALAPPDATA\CopilotProxy\bin\codex-copilot.cmd"
+```
+
+The launcher finds the installed Codex app's bundled CLI, including after app
+updates, and selects `~\.codex\copilot-local.config.toml`. It does not replace
+Codex or modify existing client authentication.
+If `codex` is already on PATH, `codex --profile copilot-local` is equivalent.
+The profile defaults to `gpt-6.1-sol`, medium reasoning, HTTP/SSE Responses,
+and disables hosted web search. Other account-enabled native Responses models
+can be selected with `-m`; adjust the profile's context window for that model.
+Existing client tools/MCP configuration is inherited normally.
+
+Base URL: `http://127.0.0.1:39117/v1`. Supported routes:
+`GET /health`, authenticated `GET /v1/models`, `POST /v1/responses`, and
+`POST /v1/responses/compact` (the last requires upstream support).
+No Chat Completions conversion, WebSocket bridge, or server-side tools.
+
+## Install / reinstall
+
+Requires Windows, Node 22+, PowerShell 7, the installed Codex client (0.134+ profile format
+and command-backed provider authentication), and a stored `gh` login whose
+account is entitled to Copilot:
+
+```powershell
+npm test
+pwsh.exe -NoProfile -ExecutionPolicy RemoteSigned -File .\install.ps1 -Desktop
+```
+
+No npm install is needed. The installer uses a dedicated per-user Task
+Scheduler task, **CopilotProxy**, with an interactive sign-in trigger and no
+elevation. After reboot, it starts **after this user signs in**, not before.
+It starts immediately on installation, runs on battery, and has no execution
+time limit. A small hidden PowerShell supervisor restarts a failed Node worker
+after 2-60 seconds. A native one-minute repeating trigger also restarts a
+missing supervisor, including after a force-kill; overlapping starts are ignored.
+The task's failure-restart policy is an additional safeguard.
+The task explicitly uses normal scheduling priority (4). Windows' default
+task priority (7) can severely delay child process startup on a busy devbox,
+causing even `gh --version` to exceed the credential helper's deadline.
+Installation checks authenticated model access through the actual background
+worker, not just listener health.
+The source directory must remain in place. Reinstall after moving it.
+Reinstalling backs up an existing managed profile; an unrelated profile/task
+is never overwritten. A previously enabled desktop integration stays enabled
+on reinstall. Omit `-Desktop` on a new installation for CLI-profile-only setup.
+
+## Credentials and safety
+
+Upstream credentials stay in GitHub CLI's existing OS credential storage.
+`gh auth token --hostname github.com` is captured internally, never logged.
+Inherited `GH_TOKEN`, `GITHUB_TOKEN`, and `COPILOT_GITHUB_TOKEN` are deliberately
+ignored so an app-injected temporary token is not persisted or required at
+sign-in. The stored token is reread every five minutes and after a 401; only a
+changed token is retried, before any response stream starts. Long-lived OAuth
+revocation/expiration still requires renewing the legitimate `gh` login; this
+service cannot renew an authorization that GitHub has revoked.
+
+A separate random local bearer key is DPAPI-encrypted for this Windows user at
+`%LOCALAPPDATA%\CopilotProxy\local-key.dpapi`. That directory is ACL-restricted
+to this user and SYSTEM. Codex retrieves only this local key through
+`token.ps1`; no secret is written into its TOML, source, command-line arguments,
+or logs. Do not print the token helper's output or enable HTTP body/header
+debug logging. Same-user processes are within the trust boundary.
+
+Only IPv4 loopback is bound. Browser-origin and non-loopback Host requests
+are rejected, with no CORS permission. Only the fixed Copilot upstream is used,
+redirects are forbidden, and client headers are not forwarded. Requests are
+limited to 16 MiB, four active operations, a 30-second upload, and ten minutes
+overall. Streaming uses backpressure and cancels upstream on client disconnect.
+SSE comments keep idle streams alive every 15 seconds between events. Each
+event is buffered only until its delimiter (up to 16 MiB), without buffering the
+whole response. Native terminal events end the local stream immediately,
+without waiting for upstream HTTP EOF. If HTTP EOF follows a complete JSON
+event without its final blank line, only that missing delimiter is repaired.
+The proxy never invents `response.completed`. A real truncation or stream
+transport failure produces a native `response.failed` event containing the
+request ID. The installed Codex client ignores generic SSE `error` events for
+these failures, even with a nested error object, and otherwise falls back to
+the misleading `stream closed before response.completed` message. Copilot
+error envelopes are converted to redacted `response.failed` events as well.
+This makes failures actionable; it cannot prevent Copilot from truncating a
+generation upstream. Accepted or partially delivered generations are not replayed.
+Connection-establishment failures (temporary DNS failure, refused/unreachable
+connections, or a connect timeout) are retried up to twice with backoff within
+the same overall deadline. Transient resets/timeouts reported by Node's
+`undici:client:connectError` diagnostics are also retried: this event proves
+connection establishment failed before dispatching HTTP headers. The original
+error object is tracked in a weak set, without retaining diagnostic payloads,
+URLs, or headers. Certificate and unknown errors are not retried.
+Connection resets without that evidence, ambiguous timeouts, HTTP errors,
+and partially streamed generations are not replayed: Copilot may have already
+accepted those requests. Rate limits are never automatically retried.
+Tool continuations are identified as agent requests, not new user prompts.
+Upstream error bodies are not echoed or logged.
+
+## Status and troubleshooting
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:39117/health
+Get-ScheduledTask -TaskName CopilotProxy
+Get-Content "$env:LOCALAPPDATA\CopilotProxy\service.log" -Tail 15
+```
+
+Health checks confirm the listener only, not licensing or upstream reachability.
+The two rotating service logs contain request IDs, status, timing, and redacted
+credential-helper outcomes, never prompts, tool output, or credentials.
+Transport failures also record an allowlisted error code, attempt number, and
+whether a safe connection retry will occur. `phase: "connect"` identifies a failure
+observed during connection establishment; `phase: "unknown"` must not be
+interpreted as proof the POST was never sent. Match the response's `x-request-id`
+header to the log's `request_id`. A 502 indicates a failed upstream connection,
+not proof that the stored GitHub login is invalid; unknown transport errors are
+recorded as `unknown` without logging their potentially sensitive messages.
+For SSE, request logs also contain the last allowlisted event type and any
+native terminal event. `completed` refers to local HTTP delivery, not model
+completion; only `terminal_event: "response.completed"` confirms that native
+completion was observed. `repaired_final_delimiter` identifies an EOF framing
+repair. `upstream_stream_error` records a missing terminal event, transport
+failure, deadline, or client disconnect without logging event bodies.
+`upstream_stream_incomplete` means the upstream ended without a terminal event.
+`upstream_reported_error` means Copilot sent an error envelope; its code is
+allowlisted in `provider_error_code`, never its message or body.
+`github_auth_timeout` means the credential helper timed out, **not** that the
+login is invalid: check task priority/process health before signing in again.
+`github_auth_not_signed_in` means no stored login was found; use
+`gh auth login --hostname github.com` in that case. A provider 401 means
+the stored credential was rejected. A 403 means check entitlement or policy;
+429 indicates upstream allowance/rate limits or the local concurrency bound.
+Model/endpoint availability is never silently substituted.
+
+```powershell
+Stop-ScheduledTask -TaskName CopilotProxy
+Start-ScheduledTask -TaskName CopilotProxy
+```
+
+The watchdog undoes a stop within a minute. To leave it stopped, first run
+`Disable-ScheduledTask -TaskName CopilotProxy`, then stop it. Run
+`Enable-ScheduledTask -TaskName CopilotProxy` and start it to resume.
+
+## Uninstall
+
+```powershell
+pwsh.exe -NoProfile -ExecutionPolicy RemoteSigned -File .\uninstall.ps1
+```
+
+Removes the task, worker, managed profile, local key, and launcher/PATH entry.
+Restores the previous desktop provider/web-search setting only when the
+installed values are still selected, and removes the marked provider block.
+Leaves source, redacted logs, and configuration backups. It never signs out of
+GitHub or overwrites unrelated config edits. To revert only the desktop
+selection while keeping the service, run `.\configure-desktop.ps1 -Remove`.
