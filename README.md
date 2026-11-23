@@ -102,8 +102,10 @@ redirects are forbidden, and client headers are not forwarded. Requests are
 limited to 16 MiB, four active operations, a 30-second upload, and ten minutes
 overall. Streaming uses backpressure and cancels upstream on client disconnect.
 SSE comments keep idle streams alive every 15 seconds between events. Each
-event is buffered only until its delimiter (up to 16 MiB), without buffering the
-whole response. Native terminal events end the local stream immediately,
+event is buffered only until its delimiter (up to 16 MiB). For eligible early
+stream recovery, up to 1 MiB of initial lifecycle/reasoning-item events is also
+held until the first non-prefix event; the whole response is never buffered.
+Native terminal events end the local stream immediately,
 without waiting for upstream HTTP EOF. If HTTP EOF follows a complete JSON
 event without its final blank line, only that missing delimiter is repaired.
 The proxy never invents `response.completed`. A real truncation or stream
@@ -112,17 +114,34 @@ request ID. The installed Codex client ignores generic SSE `error` events for
 these failures, even with a nested error object, and otherwise falls back to
 the misleading `stream closed before response.completed` message. Copilot
 error envelopes are converted to redacted `response.failed` events as well.
-This makes failures actionable; it cannot prevent Copilot from truncating a
-generation upstream. Accepted or partially delivered generations are not replayed.
+Copilot can still truncate a generation upstream. A stateless `POST /v1/responses`
+with `store: false`, no conversation/previous-response reference, no background
+execution, and only client-side function/custom tools (or no tools) can recover
+from an early EOF or transient body reset up to twice. Initial
+`response.created`, `response.in_progress`, and reasoning-item added/done events
+are withheld and discarded on retry, so only the successful attempt's response
+ID and prefix reach Codex. Heartbeats continue during initial reasoning.
+Any text/reasoning delta, tool-call event, unknown event, or prefix-buffer
+overflow commits the attempt and permanently disables stream retries.
+Stored/stateful/background requests, hosted tools, native terminal failures,
+HTTP errors, and provider error envelopes are never regenerated.
+Retries share the original ten-minute deadline, use backoff, and stop on client
+cancellation. Failed accepted attempts can still consume Copilot usage even
+when their prefix is discarded. Partial output is never replayed, and a
+completed response is never synthesized.
 Connection-establishment failures (temporary DNS failure, refused/unreachable
-connections, or a connect timeout) are retried up to twice with backoff within
-the same overall deadline. Transient resets/timeouts reported by Node's
+connections, or a connect timeout) are retried up to five times, with delays of
+250 ms, 1 s, 4 s, 10 s, and 20 s within the same overall deadline. With Node's
+default ten-second connect timeout, six timed-out attempts allow approximately
+95 seconds for a temporary outage to clear. This recovery applies in existing
+long-running chats as well as new ones, and stops on client cancellation.
+Transient resets/timeouts reported by Node's
 `undici:client:connectError` diagnostics are also retried: this event proves
 connection establishment failed before dispatching HTTP headers. The original
 error object is tracked in a weak set, without retaining diagnostic payloads,
 URLs, or headers. Certificate and unknown errors are not retried.
-Connection resets without that evidence, ambiguous timeouts, HTTP errors,
-and partially streamed generations are not replayed: Copilot may have already
+Pre-header connection resets without that evidence, ambiguous timeouts, HTTP
+errors, and committed streams are not replayed: Copilot may have already
 accepted those requests. Rate limits are never automatically retried.
 Tool continuations are identified as agent requests, not new user prompts.
 Upstream error bodies are not echoed or logged.
@@ -139,18 +158,32 @@ Health checks confirm the listener only, not licensing or upstream reachability.
 The two rotating service logs contain request IDs, status, timing, and redacted
 credential-helper outcomes, never prompts, tool output, or credentials.
 Transport failures also record an allowlisted error code, attempt number, and
-whether a safe connection retry will occur. `phase: "connect"` identifies a failure
-observed during connection establishment; `phase: "unknown"` must not be
+whether a safe connection retry will occur, including `retry_delay_ms` when
+retrying. `upstream_connection_recovered` records the successful retry's attempt
+number. Exhausted connect timeouts return `upstream_connect_timeout`, with the
+allowlisted transport reason and attempt count in the error message.
+`phase: "connect"` identifies a failure observed during connection establishment;
+`phase: "unknown"` must not be
 interpreted as proof the POST was never sent. Match the response's `x-request-id`
 header to the log's `request_id`. A 502 indicates a failed upstream connection,
 not proof that the stored GitHub login is invalid; unknown transport errors are
 recorded as `unknown` without logging their potentially sensitive messages.
+For example, repeated `UND_ERR_CONNECT_TIMEOUT` entries with `phase: "connect"`
+mean a connection could not be established before HTTP dispatch. They do not
+indicate an expired chat session or a rejected credential. A network outage that
+outlasts the bounded recovery window can still fail; check VPN/network
+reachability and retry the turn once connectivity returns.
 For SSE, request logs also contain the last allowlisted event type and any
 native terminal event. `completed` refers to local HTTP delivery, not model
 completion; only `terminal_event: "response.completed"` confirms that native
 completion was observed. `repaired_final_delimiter` identifies an EOF framing
 repair. `upstream_stream_error` records a missing terminal event, transport
 failure, deadline, or client disconnect without logging event bodies.
+`upstream_stream_retry` records an eligible early-stream recovery with
+`stream_attempt` and `output_committed: false`. `last_item_type` distinguishes
+reasoning, text-message, and tool-call items without recording their contents.
+The final request log reports the last attempt's terminal event and attempt
+number; `output_committed` means the non-replaceable stream prefix has been sent.
 `upstream_stream_incomplete` means the upstream ended without a terminal event.
 `upstream_reported_error` means Copilot sent an error envelope; its code is
 allowlisted in `provider_error_code`, never its message or body.

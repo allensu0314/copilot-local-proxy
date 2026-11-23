@@ -14,6 +14,7 @@ async function fixture(t, options = {}) {
   const server = createProxy({
     localToken, getProviderToken: async () => 'synthetic-upstream-token',
     fetchImpl: async () => new Response('{}', { headers: { 'content-type': 'application/json' } }),
+    connectionRetryDelaysMs: [1, 2, 4, 8, 16],
     ...options,
   });
   server.listen(0, '127.0.0.1');
@@ -184,7 +185,7 @@ test('connection-establishment failures retry with the same request bytes, ID, a
   assert.equal(JSON.stringify(logs).includes('PRIVATE_'), false);
 });
 
-test('temporary DNS failures stop after three attempts and return a correlated, redacted 502', async t => {
+test('temporary DNS failures stop after six attempts and return a correlated, redacted 502', async t => {
   const logs = [];
   let calls = 0;
   const { post } = await fixture(t, {
@@ -201,10 +202,72 @@ test('temporary DNS failures stop after three attempts and return a correlated, 
   const body = await r.json();
   assert.equal(body.error.code, 'upstream_unavailable');
   assert.match(body.error.message, /does not indicate a rejected GitHub login/);
-  assert.equal(calls, 3);
+  assert.equal(calls, 6);
   const failures = logs.filter(entry => entry.event === 'upstream_connection_error');
-  assert.deepEqual(failures.map(entry => entry.retrying), [true, true, false]);
+  assert.deepEqual(failures.map(entry => entry.retrying), [true, true, true, true, true, false]);
+  assert.deepEqual(failures.map(entry => entry.retry_delay_ms), [1, 2, 4, 8, 16, undefined]);
   assert.ok(failures.every(entry => entry.request_id === r.headers.get('x-request-id')));
+  assert.equal(JSON.stringify([body, logs]).includes('PRIVATE_'), false);
+});
+
+test('a proxy running over an hour refreshes credentials and recovers beyond three connect timeouts', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  let credentialReads = 0;
+  const requests = [];
+  const logs = [];
+  const { post } = await fixture(t, {
+    getProviderToken: createTokenSource(async () => `synthetic-credential-${++credentialReads}`),
+    log: entry => logs.push(entry),
+    fetchImpl: async (url, init) => {
+      requests.push({ url, init });
+      if (requests.length > 1 && requests.length < 6) {
+        throw new TypeError('PRIVATE_NETWORK_DETAIL', {
+          cause: Object.assign(new Error('PRIVATE_ADDRESS'), { code: 'UND_ERR_CONNECT_TIMEOUT' }),
+        });
+      }
+      return Response.json({ recovered: true });
+    },
+  });
+  assert.equal((await post()).status, 200);
+  t.mock.timers.tick(61 * 60_000);
+  const r = await post({ ...payload, input: 'Synthetic continuation after one hour' });
+  assert.equal(r.status, 200);
+  assert.deepEqual(await r.json(), { recovered: true });
+  assert.equal(credentialReads, 2);
+  assert.equal(requests.length, 6);
+  assert.equal(requests[0].init.headers.authorization, 'Bearer synthetic-credential-1');
+  assert.equal(requests[1].init.headers.authorization, 'Bearer synthetic-credential-2');
+  for (const request of requests.slice(1)) {
+    assert.deepEqual(request, requests[1]);
+    assert.equal(request.init.headers['x-request-id'], r.headers.get('x-request-id'));
+  }
+  const recovered = logs.find(entry => entry.event === 'upstream_connection_recovered');
+  assert.equal(recovered.attempt, 5);
+  assert.equal(recovered.request_id, r.headers.get('x-request-id'));
+  assert.equal(JSON.stringify(logs).includes('PRIVATE_'), false);
+});
+
+test('exhausted connect timeouts report the safe reason, attempt count, and request ID', async t => {
+  const logs = [];
+  let calls = 0;
+  const { post } = await fixture(t, {
+    log: entry => logs.push(entry),
+    fetchImpl: async () => {
+      calls++;
+      throw new TypeError('PRIVATE_NETWORK_DETAIL', {
+        cause: Object.assign(new Error('PRIVATE_ADDRESS'), { code: 'UND_ERR_CONNECT_TIMEOUT' }),
+      });
+    },
+  });
+  const r = await post();
+  assert.equal(r.status, 502);
+  const body = await r.json();
+  assert.equal(body.error.code, 'upstream_connect_timeout');
+  assert.match(body.error.message, /UND_ERR_CONNECT_TIMEOUT.*after 6 attempts/);
+  assert.match(body.error.message, /does not indicate a rejected GitHub login/);
+  assert.equal(calls, 6);
+  assert.ok(logs.every(entry => entry.request_id === r.headers.get('x-request-id')));
+  assert.equal(logs.some(entry => entry.event === 'upstream_connection_recovered'), false);
   assert.equal(JSON.stringify([body, logs]).includes('PRIVATE_'), false);
 });
 
@@ -339,6 +402,7 @@ test('the overall deadline cancels connection retry backoff without another atte
   let calls = 0;
   const { post } = await fixture(t, {
     timeoutMs: 100,
+    connectionRetryDelaysMs: [250, 1_000, 4_000, 10_000, 20_000],
     fetchImpl: async () => {
       calls++;
       throw new TypeError('fetch failed', {
@@ -350,6 +414,35 @@ test('the overall deadline cancels connection retry backoff without another atte
   assert.equal(r.status, 504);
   assert.equal((await r.json()).error.code, 'upstream_timeout');
   assert.equal(calls, 1);
+});
+
+test('client cancellation stops connection retry backoff and releases the active request', async t => {
+  let calls = 0;
+  let onRetry;
+  let onFinished;
+  const retry = new Promise(resolve => { onRetry = resolve; });
+  const done = new Promise(resolve => { onFinished = resolve; });
+  const { post } = await fixture(t, {
+    maxConcurrent: 1,
+    connectionRetryDelaysMs: [250, 1_000, 4_000, 10_000, 20_000],
+    log: entry => {
+      if (entry.event === 'upstream_connection_error') onRetry();
+      if (entry.event === 'request') onFinished();
+    },
+    fetchImpl: async () => {
+      if (++calls === 1) throw Object.assign(new Error('PRIVATE_DETAIL'), { code: 'ECONNREFUSED' });
+      return Response.json({ recovered: true });
+    },
+  });
+  const controller = new AbortController();
+  const cancelled = assert.rejects(post(payload, { signal: controller.signal }), { name: 'AbortError' });
+  await retry;
+  controller.abort();
+  await cancelled;
+  await done;
+  assert.equal(calls, 1);
+  assert.equal((await post()).status, 200);
+  assert.equal(calls, 2);
 });
 
 test('SSE is delivered incrementally and client cancellation aborts the upstream operation', async t => {
@@ -475,6 +568,195 @@ test('a clean HTTP EOF without a terminal event is not reported as response comp
       assert.equal(logs.at(-1).terminal_event, undefined);
     });
   }
+});
+
+const sse = event => `data: ${JSON.stringify(event)}\n\n`;
+const reasoningPrefix = id => sse({ type: 'response.created', response: { id } }) +
+  sse({ type: 'response.in_progress', response: { id } }) +
+  sse({ type: 'response.output_item.added', item: { type: 'reasoning', id: `${id}_reasoning` } });
+
+test('a stateless stream truncated during initial reasoning recovers without leaking the failed prefix', async t => {
+  const logs = [];
+  const requests = [];
+  const recovered = reasoningPrefix('recovered') +
+    sse({ type: 'response.output_text.delta', delta: 'RECOVERED' }) +
+    sse({ type: 'response.completed', response: { id: 'recovered' } });
+  const { post } = await fixture(t, {
+    log: entry => logs.push(entry),
+    fetchImpl: async (url, init) => {
+      requests.push({ url, init });
+      return new Response(requests.length === 1 ? reasoningPrefix('discarded') : recovered,
+        { headers: { 'content-type': 'text/event-stream' } });
+    },
+  });
+  const body = { ...payload, store: false, tools: [{ type: 'function', name: 'probe' }] };
+  const r = await post(body);
+  assert.equal(await r.text(), recovered);
+  assert.equal(requests.length, 2);
+  assert.deepEqual(requests[0], requests[1]);
+  assert.deepEqual(JSON.parse(requests[1].init.body), body);
+  const retry = logs.find(entry => entry.event === 'upstream_stream_retry');
+  assert.equal(retry.reason, 'upstream_stream_incomplete');
+  assert.equal(retry.last_item_type, 'reasoning');
+  assert.equal(retry.output_committed, false);
+  assert.equal(retry.request_id, r.headers.get('x-request-id'));
+  assert.equal(logs.at(-1).stream_attempt, 2);
+  assert.equal(logs.at(-1).terminal_event, 'response.completed');
+  assert.equal(JSON.stringify(logs).includes('discarded'), false);
+});
+
+test('stateless early stream recovery stops after three attempts without inventing completion', async t => {
+  const logs = [];
+  let calls = 0;
+  const { post } = await fixture(t, {
+    log: entry => logs.push(entry),
+    fetchImpl: async () => {
+      return new Response(reasoningPrefix(`discarded_${++calls}`),
+        { headers: { 'content-type': 'text/event-stream' } });
+    },
+  });
+  const text = await (await post({ ...payload, store: false })).text();
+  assert.equal(calls, 3);
+  assert.equal(text.includes('discarded'), false);
+  const event = JSON.parse(text.split('\n')[1].slice(6));
+  assert.equal(event.type, 'response.failed');
+  assert.equal(event.response.error.code, 'upstream_stream_incomplete');
+  assert.equal(logs.filter(entry => entry.event === 'upstream_stream_retry').length, 2);
+  assert.equal(logs.at(-1).stream_attempt, 3);
+  assert.equal(logs.at(-1).terminal_event, undefined);
+});
+
+test('delivered text, reasoning, tool-call events, unknown events, and large prefixes are never replayed', async t => {
+  for (const event of [
+    { type: 'response.output_text.delta', delta: 'visible output' },
+    { type: 'response.reasoning_summary_text.delta', delta: 'visible reasoning' },
+    { type: 'response.output_item.added', item: { type: 'function_call', name: 'probe' } },
+    { type: 'response.function_call_arguments.delta', delta: '{}' },
+    { type: 'response.custom_tool_call_input.delta', delta: 'probe' },
+    { type: 'future_unknown_event' },
+    { type: 'response.output_item.added', item: { type: 'reasoning', encrypted_content: 'x'.repeat(1024 * 1024) } },
+  ]) {
+    await t.test(event.type, async t => {
+      let calls = 0;
+      const source = reasoningPrefix('original') + sse(event);
+      const { post } = await fixture(t, {
+        fetchImpl: async () => {
+          calls++;
+          return new Response(source, { headers: { 'content-type': 'text/event-stream' } });
+        },
+      });
+      const text = await (await post({ ...payload, store: false })).text();
+      assert.ok(text.startsWith(source));
+      assert.match(text, /"code":"upstream_stream_incomplete"/);
+      assert.equal(calls, 1);
+    });
+  }
+});
+
+test('stored, stateful, background, and hosted-tool requests are not regenerated even before output', async t => {
+  for (const options of [
+    { store: undefined }, { store: true }, { previous_response_id: 'resp_previous' },
+    { conversation: 'conv_synthetic' }, { background: true },
+    { tools: [{ type: 'web_search' }] }, { tools: [{ type: 'mcp' }] },
+    { tools: [{ type: 'future_tool' }] },
+  ]) {
+    await t.test(JSON.stringify(options), async t => {
+      let calls = 0;
+      const source = reasoningPrefix('original');
+      const { post } = await fixture(t, {
+        fetchImpl: async () => {
+          calls++;
+          return new Response(source, { headers: { 'content-type': 'text/event-stream' } });
+        },
+      });
+      const text = await (await post({ ...payload, store: false, ...options })).text();
+      assert.ok(text.startsWith(source));
+      assert.equal(calls, 1);
+    });
+  }
+});
+
+test('early recovery never retries native terminal failures or rate limits on a replacement request', async t => {
+  for (const type of ['response.failed', 'response.incomplete', 'error', 'retry_429']) {
+    await t.test(type, async t => {
+      let calls = 0;
+      const { post } = await fixture(t, {
+        fetchImpl: async () => {
+          calls++;
+          if (type === 'retry_429') {
+            return calls === 1 ?
+              new Response(reasoningPrefix('discarded'), { headers: { 'content-type': 'text/event-stream' } }) :
+              new Response('PRIVATE_RATE_LIMIT', { status: 429, headers: { 'retry-after': '7' } });
+          }
+          return new Response(sse({ type, response: { error: { code: 'synthetic_failure' } } }),
+            { headers: { 'content-type': 'text/event-stream' } });
+        },
+      });
+      const text = await (await post({ ...payload, store: false })).text();
+      assert.equal(calls, type === 'retry_429' ? 2 : 1);
+      assert.equal(text.includes('PRIVATE_'), false);
+      if (type === 'retry_429') assert.match(text, /"code":"copilot_http_429"/);
+    });
+  }
+});
+
+test('a transient body reset before committed output can recover without repeating partial frames', async t => {
+  let calls = 0;
+  const complete = sse({ type: 'response.completed', response: { id: 'recovered' } });
+  const { post } = await fixture(t, {
+    fetchImpl: async () => {
+      if (++calls > 1) return new Response(complete, { headers: { 'content-type': 'text/event-stream' } });
+      let reads = 0;
+      return new Response(new ReadableStream({
+        pull(c) {
+          if (++reads === 1) c.enqueue(new TextEncoder().encode(reasoningPrefix('discarded')));
+          else c.error(Object.assign(new Error('PRIVATE_TRANSPORT'), { code: 'ECONNRESET' }));
+        },
+      }), { headers: { 'content-type': 'text/event-stream' } });
+    },
+  });
+  const text = await (await post({ ...payload, store: false })).text();
+  assert.equal(text, complete);
+  assert.equal(calls, 2);
+});
+
+test('early stream retry backoff respects the original deadline and client cancellation', async t => {
+  await t.test('deadline', async t => {
+    let calls = 0;
+    const { post } = await fixture(t, {
+      timeoutMs: 100,
+      fetchImpl: async () => {
+        calls++;
+        return new Response(reasoningPrefix('discarded'), { headers: { 'content-type': 'text/event-stream' } });
+      },
+    });
+    const text = await (await post({ ...payload, store: false })).text();
+    assert.match(text, /"code":"upstream_timeout"/);
+    assert.equal(text.includes('discarded'), false);
+    assert.equal(calls, 1);
+  });
+  await t.test('client cancellation', async t => {
+    let calls = 0;
+    let onRetry;
+    let onFinished;
+    const retry = new Promise(resolve => { onRetry = resolve; });
+    const done = new Promise(resolve => { onFinished = resolve; });
+    const { post } = await fixture(t, {
+      log: entry => {
+        if (entry.event === 'upstream_stream_retry') onRetry();
+        if (entry.event === 'request') onFinished();
+      },
+      fetchImpl: async () => {
+        calls++;
+        return new Response(reasoningPrefix('discarded'), { headers: { 'content-type': 'text/event-stream' } });
+      },
+    });
+    const r = await post({ ...payload, store: false });
+    await retry;
+    await r.body.cancel();
+    await done;
+    assert.equal(calls, 1);
+  });
 });
 
 test('heartbeats keep idle streams alive but are never inserted into partially received events', async t => {

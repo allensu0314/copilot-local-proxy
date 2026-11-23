@@ -203,8 +203,16 @@ const providerErrorCodes = new Set([
   'internal_server_error', 'server_is_overloaded', 'rate_limit_exceeded',
   'context_length_exceeded', 'invalid_prompt', 'content_filter', 'insufficient_quota',
 ]);
+const itemTypes = new Set(['reasoning', 'message', 'function_call', 'custom_tool_call']);
 
-async function* responseEvents(body, { signal, heartbeatMs, state }) {
+function canRetryStream(body) {
+  return body.store === false && body.previous_response_id === undefined &&
+    body.conversation === undefined && (body.background === undefined || body.background === false) &&
+    (body.tools === undefined || (Array.isArray(body.tools) &&
+      body.tools.every(tool => tool && ['function', 'custom'].includes(tool.type))));
+}
+
+async function* responseEvents(body, { signal, heartbeatMs, state, deferPrefix = false }) {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let pendingRead;
@@ -212,14 +220,20 @@ async function* responseEvents(body, { signal, heartbeatMs, state }) {
   let scan = 0;
   let lineStart = 0;
   let ended = false;
+  let prefix = [];
+  let prefixBytes = 0;
   function inspect(frame) {
     const lines = frame.split(/\r\n|\r|\n/);
     const data = lines
       .filter(line => line === 'data' || line.startsWith('data:'))
       .map(line => line === 'data' ? '' : line.slice(5).replace(/^ /, '')).join('\n');
+    if (!data && lines.every(line => !line || line.startsWith(':'))) return { comment: true };
     let event;
     try { event = JSON.parse(data); } catch { return false; }
     state.last_event = streamEvents.has(event?.type) ? event.type : 'unknown';
+    if (event?.type === 'response.output_item.added' || event?.type === 'response.output_item.done') {
+      state.last_item_type = itemTypes.has(event.item?.type) ? event.item.type : 'unknown';
+    }
     const errorEvent = event?.type === 'error' ||
       (!event?.type && (event?.error || lines.some(line => /^event: ?error$/.test(line))));
     if (errorEvent) {
@@ -230,7 +244,30 @@ async function* responseEvents(body, { signal, heartbeatMs, state }) {
         'Copilot reported a stream failure. Partial output was not replayed.');
     }
     state.terminal_event = terminalEvents.has(event?.type) ? event.type : undefined;
-    return true;
+    return {
+      prefix: ['response.created', 'response.in_progress'].includes(event?.type) ||
+        (['response.output_item.added', 'response.output_item.done'].includes(event?.type) &&
+          event.item?.type === 'reasoning'),
+    };
+  }
+  function* deliver(frame, inspected) {
+    if (inspected?.comment) {
+      yield frame;
+      return;
+    }
+    if (deferPrefix && !state.output_committed && inspected?.prefix &&
+        prefixBytes + Buffer.byteLength(frame) <= 1024 * 1024) {
+      prefix.push(frame);
+      prefixBytes += Buffer.byteLength(frame);
+      return;
+    }
+    // Once any non-prefix event is delivered, no part of this attempt can
+    // be replaced. In particular, tool-call events must never be replayed.
+    state.output_committed = true;
+    yield* prefix;
+    prefix = [];
+    prefixBytes = 0;
+    yield frame;
   }
   try {
     while (true) {
@@ -270,8 +307,7 @@ async function* responseEvents(body, { signal, heartbeatMs, state }) {
         if (Buffer.byteLength(frame) > 16 * 1024 * 1024) {
           throw new ProxyError(502, 'upstream_event_too_large', 'Copilot returned an oversized stream event.');
         }
-        inspect(frame);
-        yield frame;
+        yield* deliver(frame, inspect(frame));
         if (state.terminal_event) return;
       }
       if (Buffer.byteLength(buffer) > 16 * 1024 * 1024) {
@@ -280,9 +316,10 @@ async function* responseEvents(body, { signal, heartbeatMs, state }) {
       if (!ended) continue;
       // Some upstreams close after complete JSON without the SSE blank line.
       // Dispatch that genuine event; never synthesize response.completed.
-      if (buffer && inspect(buffer)) {
+      const inspected = buffer && inspect(buffer);
+      if (inspected) {
         state.repaired_final_delimiter = true;
-        yield buffer + (buffer.endsWith('\n') ? '\n' : '\n\n');
+        yield* deliver(buffer + (buffer.endsWith('\n') ? '\n' : '\n\n'), inspected);
         if (state.terminal_event) return;
       }
       throw new ProxyError(502, 'upstream_stream_incomplete',
@@ -299,6 +336,7 @@ export function createProxy({
   localToken, getProviderToken, fetchImpl = fetch, log = () => {},
   maxBodyBytes = 16 * 1024 * 1024, maxConcurrent = 4, timeoutMs = 600_000,
   heartbeatMs = 15_000,
+  connectionRetryDelaysMs = [250, 1_000, 4_000, 10_000, 20_000],
 }) {
   if (typeof localToken !== 'string' || localToken.length < 32) throw new Error('A strong local bearer key is required.');
   const expected = Buffer.from(`Bearer ${localToken}`);
@@ -311,7 +349,7 @@ export function createProxy({
     let counted = false;
     let abortReason;
     let streaming = false;
-    const streamState = { last_event: 'none' };
+    let streamState = { last_event: 'none' };
     const timer = setTimeout(() => {
       abortReason = 'deadline';
       controller.abort();
@@ -385,36 +423,56 @@ export function createProxy({
         for (let attempt = 1; ; attempt++) {
           controller.signal.throwIfAborted();
           try {
-            return await sendOnce();
+            const result = await sendOnce();
+            if (attempt > 1) log({
+              event: 'upstream_connection_recovered', request_id: requestId,
+              attempt, duration_ms: Date.now() - started,
+            });
+            return result;
           } catch (error) {
             if (controller.signal.aborted) throw error;
             const { reason, retryable, phase } = transportFailure(error);
-            const retrying = retryable && attempt < 3;
+            // Give a brief network outage time to clear, but only when the
+            // failure proves no HTTP request was dispatched.
+            const retryDelayMs = connectionRetryDelaysMs[attempt - 1];
+            const retrying = retryable && retryDelayMs !== undefined;
             log({
               event: 'upstream_connection_error', request_id: requestId,
               attempt, reason, phase, retrying, duration_ms: Date.now() - started,
+              ...(retrying ? { retry_delay_ms: retryDelayMs } : {}),
             });
-            if (!retrying) throw error;
-            await delay(250 * 2 ** (attempt - 1), undefined, { signal: controller.signal });
+            if (!retrying) {
+              if (!retryable) throw error;
+              const timeout = ['UND_ERR_CONNECT_TIMEOUT', 'ETIMEDOUT'].includes(reason);
+              throw new ProxyError(502, timeout ? 'upstream_connect_timeout' : 'upstream_unavailable',
+                `Copilot connection establishment failed (${reason}) after ${attempt} attempts. ` +
+                'Check network reachability and the redacted service log using x-request-id; ' +
+                'this does not indicate a rejected GitHub login.');
+            }
+            await delay(retryDelayMs, undefined, { signal: controller.signal });
           }
         }
       };
       if (controller.signal.aborted) throw new Error('Request aborted');
-      let result = await send();
-      if (result.status === 401) {
-        await result.body?.cancel();
-        const fresh = await getProviderToken({ refresh: true });
-        if (fresh !== token) {
-          token = fresh;
-          result = await send();
+      const fetchResult = async () => {
+        let result = await send();
+        if (result.status === 401) {
+          await result.body?.cancel();
+          const fresh = await getProviderToken({ refresh: true });
+          if (fresh !== token) {
+            token = fresh;
+            result = await send();
+          }
         }
-      }
-      if (!result.ok) {
-        await result.body?.cancel();
-        const retryAfter = result.headers.get('retry-after');
-        if (retryAfter && /^\d{1,8}$/.test(retryAfter)) res.setHeader('retry-after', retryAfter);
-        throw new ProxyError(result.status, `copilot_http_${result.status}`, upstreamError(result.status));
-      }
+        if (!result.ok) {
+          await result.body?.cancel();
+          const retryAfter = result.headers.get('retry-after');
+          if (!res.headersSent && retryAfter && /^\d{1,8}$/.test(retryAfter)) res.setHeader('retry-after', retryAfter);
+          throw new ProxyError(result.status, `copilot_http_${result.status}`, upstreamError(result.status));
+        }
+        return result;
+      };
+      let result = await fetchResult();
       res.writeHead(result.status, {
         'content-type': result.headers.get('content-type') || 'application/json',
         'cache-control': 'no-store',
@@ -424,15 +482,39 @@ export function createProxy({
         result.headers.get('content-type')?.split(';')[0].trim().toLowerCase() === 'text/event-stream';
       if (streaming) {
         res.flushHeaders();
-        if (!result.body) {
-          throw new ProxyError(502, 'upstream_stream_incomplete', 'Copilot returned an empty stream.');
-        }
+        const recoverable = req.url === '/v1/responses' && canRetryStream(body);
         // Keep the response writable on upstream failure so Codex receives an
         // explicit SSE error instead of an unexplained socket close.
-        for await (const chunk of responseEvents(result.body, {
-          signal: controller.signal, heartbeatMs, state: streamState,
-        })) {
-          if (!res.write(chunk)) await once(res, 'drain', { signal: controller.signal });
+        for (let attempt = 1; ; attempt++) {
+          streamState = { last_event: 'none', stream_attempt: attempt, output_committed: false };
+          try {
+            if (!result.body) {
+              throw new ProxyError(502, 'upstream_stream_incomplete', 'Copilot returned an empty stream.');
+            }
+            for await (const chunk of responseEvents(result.body, {
+              signal: controller.signal, heartbeatMs, state: streamState, deferPrefix: recoverable,
+            })) {
+              if (!res.write(chunk)) await once(res, 'drain', { signal: controller.signal });
+            }
+            break;
+          } catch (error) {
+            const reason = error instanceof ProxyError ? error.code : transportFailure(error).reason;
+            const transient = reason === 'upstream_stream_incomplete' ||
+              ['ECONNRESET', 'EPIPE', 'UND_ERR_SOCKET', 'UND_ERR_BODY_TIMEOUT'].includes(reason);
+            if (!recoverable || streamState.output_committed || !transient ||
+                attempt >= 3 || controller.signal.aborted) throw error;
+            log({
+              event: 'upstream_stream_retry', request_id: requestId,
+              reason, ...streamState, duration_ms: Date.now() - started,
+            });
+            await delay(250 * 2 ** (attempt - 1), undefined, { signal: controller.signal });
+            streamState = { last_event: 'none', stream_attempt: attempt + 1, output_committed: false };
+            result = await fetchResult();
+            if (result.headers.get('content-type')?.split(';')[0].trim().toLowerCase() !== 'text/event-stream') {
+              await result.body?.cancel();
+              throw new ProxyError(502, 'upstream_invalid_stream', 'Copilot did not return an SSE stream on retry.');
+            }
+          }
         }
         res.end();
         await finished(res, { cleanup: true });
