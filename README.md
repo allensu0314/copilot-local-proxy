@@ -7,7 +7,88 @@ Copilot licensing, model access, organization policies, and usage limits still
 apply. The Copilot endpoint is not a guaranteed public third-party API and may
 change.
 
-## Installed usage
+## Windows, Linux, and macOS
+
+The HTTP service runs on all three platforms with Node 22+ and a stored GitHub
+CLI (`gh`) login entitled to Copilot. PowerShell 7 is required only on Windows.
+No npm dependencies need to be installed.
+
+| Platform | Background startup | Local state and key |
+| --- | --- | --- |
+| Windows | Existing per-user Task Scheduler task | `%LOCALAPPDATA%\CopilotProxy`, DPAPI-encrypted key |
+| Linux | `systemd --user` service | `$XDG_STATE_HOME/copilot-proxy`, or `~/.local/state/copilot-proxy`; directory `0700`, key `0600` |
+| macOS | User `launchd` agent | `~/Library/Application Support/CopilotProxy`; directory `0700`, key `0600` |
+
+Run from this checkout after installing Node, GitHub CLI, and Codex:
+
+```sh
+gh auth login --hostname github.com
+npm test
+node manage.mjs install
+node manage.mjs codex
+```
+
+Use `node manage.mjs install --desktop` to select this provider for new Codex
+desktop chats. Without `--desktop`, the dedicated `copilot-local` CLI profile
+is installed and desktop defaults are preserved. Requires a Codex client with
+v2 configuration profiles and command-backed authentication (0.134+).
+On Windows, the command delegates to the existing PowerShell installer and
+launcher. The Windows commands below remain supported.
+
+Linux/macOS installation records the absolute Node and GitHub CLI paths, so
+login services can run without an interactive shell's PATH. The generated
+Codex auth command reads the local key with Node; it does not require
+PowerShell. The source checkout and the recorded executable paths must remain
+available; reinstall after moving them. A reinstall preserves the local key,
+backs up changed Codex configuration, and retains an enabled desktop integration.
+
+For a Linux container, WSL session without systemd, or foreground development:
+
+```sh
+node manage.mjs install --no-service --port 39117
+npm start
+# In another terminal:
+node manage.mjs codex exec "Reply exactly CONNECTED. Do not use tools."
+```
+
+`--no-service` is available on Linux/macOS. Run `npm start` under the process
+manager of your choice. Linux/macOS services start at user login; Linux does
+not enable system-wide lingering or require sudo. A Linux user session must
+provide a working `systemctl --user` bus. macOS installation requires a logged-in
+GUI session. Use `--no-service` when these facilities are unavailable.
+
+The service can locate its installation configuration and local key without
+environment bearer credentials. `COPILOT_PROXY_CONFIG` selects an explicit
+configuration file; `COPILOT_PROXY_LOCAL_TOKEN_FILE` selects a local key file.
+On Unix, the key must be a regular file owned by the current user, with no group
+or other permissions; symlink keys are rejected. `COPILOT_PROXY_DATA_DIR`
+selects a custom Linux/macOS state directory at installation time.
+`COPILOT_PROXY_CODEX_PATH` optionally selects the Unix Codex CLI executable.
+
+Linux/macOS write redacted rotating `service.log` / `service.previous.log` files
+in the state directory, with a 2 MiB rotation threshold. Useful native controls:
+
+```sh
+# Linux
+systemctl --user status copilot-proxy.service
+systemctl --user restart copilot-proxy.service
+systemctl --user disable --now copilot-proxy.service
+# macOS (run in a logged-in GUI session)
+launchctl print "gui/$(id -u)/com.copilot.proxy"
+launchctl kickstart -k "gui/$(id -u)/com.copilot.proxy"
+launchctl bootout "gui/$(id -u)/com.copilot.proxy"
+```
+
+Remove the managed service, local key, and client integration with
+`node manage.mjs uninstall`. Logs and configuration backups are retained;
+desktop values changed by the user after installation are preserved. A manually
+started foreground process must be stopped separately before uninstalling.
+Unmanaged client profiles, providers, and service files are never overwritten.
+
+GitHub Actions runs the test suite on Windows, Linux, and macOS with Node 22
+and 24, including native service-file validation on Unix.
+
+## Windows installed usage
 
 Open the installed **Codex desktop app**, select **Codex** mode, and start a
 **new local chat**. On this app build the window is titled ChatGPT. The desktop
@@ -51,7 +132,7 @@ No Chat Completions conversion, WebSocket bridge, or server-side tools.
 
 ## Install / reinstall
 
-Requires Windows, Node 22+, PowerShell 7, the installed Codex client (0.134+ profile format
+This Windows installer requires Node 22+, PowerShell 7, the installed Codex client (0.134+ profile format
 and command-backed provider authentication), and a stored `gh` login whose
 account is entitled to Copilot:
 
@@ -89,7 +170,7 @@ changed token is retried, before any response stream starts. Long-lived OAuth
 revocation/expiration still requires renewing the legitimate `gh` login; this
 service cannot renew an authorization that GitHub has revoked.
 
-A separate random local bearer key is DPAPI-encrypted for this Windows user at
+A separate random local bearer key on Windows is DPAPI-encrypted for this user at
 `%LOCALAPPDATA%\CopilotProxy\local-key.dpapi`. That directory is ACL-restricted
 to this user and SYSTEM. Codex retrieves only this local key through
 `token.ps1`; no secret is written into its TOML, source, command-line arguments,

@@ -2,8 +2,16 @@
   "name": "copilot-local-proxy",
   "version": "1.0.0",
   "private": true,
+  "author": "oldSahde",
+  "repository": { "type": "git", "url": "https://github.com/allensu0314/copilot-local-proxy.git" },
   "type": "module",
   "description": "Small authenticated loopback Responses proxy for Codex and GitHub Copilot.",
   "engines": { "node": ">=22" },
-  "scripts": { "test": "node --test", "start": "node server.mjs" }
+  "scripts": {
+    "test": "node --test",
+    "start": "node server.mjs",
+    "install:proxy": "node manage.mjs install",
+    "codex": "node manage.mjs codex",
+    "uninstall:proxy": "node manage.mjs uninstall"
+  }
 }

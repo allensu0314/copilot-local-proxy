@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { once } from 'node:events';
 import { createProxy } from './server.mjs';
+import { providerConfiguration } from './manage.mjs';
 
 const execute = promisify(execFile);
 
@@ -42,6 +43,13 @@ test('installed Codex recovers connection and early stream failures and surfaces
     server.listen(0, '127.0.0.1');
     await once(server, 'listening');
     try {
+      const keyPath = join(root, 'synthetic-local-key');
+      const configPath = join(root, 'synthetic-installation.json');
+      await writeFile(keyPath, localToken);
+      await writeFile(configPath, JSON.stringify({ port: server.address().port, localTokenPath: keyPath }));
+      await writeFile(join(root, 'portable-stream-test.config.toml'), providerConfiguration({
+        port: server.address().port, configPath,
+      }));
       const event = data => `data: ${JSON.stringify(data)}\n\n`;
       const earlyEof = event({ type: 'response.created', response: { id: 'resp_discarded' } }) +
         event({ type: 'response.output_item.added', item: { id: 'reasoning_discarded', type: 'reasoning' } });
@@ -64,20 +72,11 @@ test('installed Codex recovers connection and early stream failures and surfaces
         upstreamBodies = bodies;
         responseIndex = 0;
         const previousCalls = calls;
-        const args = ['exec', '--skip-git-repo-check', '--ephemeral', '--json',
-          '-c', 'model_provider="stream-test"', '-c', 'model="gpt-6.1-sol"',
-          '-c', 'web_search="disabled"',
-          '-c', 'model_providers.stream-test.name="Synthetic protocol test"',
-          '-c', `model_providers.stream-test.base_url="http://127.0.0.1:${server.address().port}/v1"`,
-          '-c', 'model_providers.stream-test.wire_api="responses"',
-          '-c', 'model_providers.stream-test.env_key="COPILOT_PROTOCOL_TEST_KEY"',
-          '-c', 'model_providers.stream-test.supports_websockets=false',
-          '-c', 'model_providers.stream-test.request_max_retries=0',
-          '-c', 'model_providers.stream-test.stream_max_retries=0',
+        const args = ['exec', '--skip-git-repo-check', '--ephemeral', '--json', '--profile', 'portable-stream-test',
           'Synthetic stream protocol test. Do not execute tools.'];
         const run = execute(cli, args, {
           cwd: root, windowsHide: true, timeout: 30_000,
-          env: { ...process.env, CODEX_HOME: root, COPILOT_PROTOCOL_TEST_KEY: localToken },
+          env: { ...process.env, CODEX_HOME: root },
         });
         run.child.stdin.end();
         if (code) {

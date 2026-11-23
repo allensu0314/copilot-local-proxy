@@ -1,7 +1,7 @@
 import http from 'node:http';
 import { timingSafeEqual, randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
-import { readFileSync, existsSync, readdirSync } from 'node:fs';
+import { existsSync, readdirSync, appendFileSync, renameSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
@@ -92,11 +92,13 @@ export function createTokenSource(readToken, ttlMs = 300_000) {
   };
 }
 
-function resolveGh(configured) {
-  if (existsSync(configured)) return configured;
-  const local = process.env.LOCALAPPDATA;
-  if (local) {
-    const candidates = readdirSync(local, { withFileTypes: true })
+export function resolveGh(configured, { platform = process.platform, env = process.env } = {}) {
+  if (typeof configured === 'string' && existsSync(configured)) return configured;
+  const local = env.LOCALAPPDATA;
+  if (platform === 'win32' && local) {
+    let entries = [];
+    try { entries = readdirSync(local, { withFileTypes: true }); } catch { /* Fall back to PATH. */ }
+    const candidates = entries
       .filter(entry => entry.isDirectory() && entry.name.startsWith('copilot-desktop-gh-'))
       .map(entry => entry.name).sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
     for (const candidate of candidates) {
@@ -104,7 +106,7 @@ function resolveGh(configured) {
       if (existsSync(path)) return path;
     }
   }
-  return 'gh.exe';
+  return platform === 'win32' ? 'gh.exe' : 'gh';
 }
 
 export function githubTokenSource(ghPath, { executeImpl = execute, log = () => {} } = {}) {
@@ -128,7 +130,7 @@ export function githubTokenSource(ghPath, { executeImpl = execute, log = () => {
         /no oauth token|not logged|no token found/i.test(error.stderr || '') ? 'not_signed_in' : 'helper_failed';
       log({ event: 'credential_read', status: 'error', reason, duration_ms: Date.now() - started });
       throw new ProxyError(503, `github_auth_${reason}`, reason === 'timeout' ?
-        'Stored GitHub credential lookup timed out. Check the CopilotProxy task and service log; sign-in may still be valid.' :
+        'Stored GitHub credential lookup timed out. Check the service and redacted log; sign-in may still be valid.' :
         reason === 'not_signed_in' ? 'No stored GitHub login was found. Sign in with gh auth login --hostname github.com.' :
         'The GitHub credential helper failed. Check the redacted service log before changing your login.');
     }
@@ -583,12 +585,24 @@ export function createProxy({
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  const log = entry => console.log(JSON.stringify({ time: new Date().toISOString(), ...entry }));
+  let logPath;
+  const log = entry => {
+    const line = JSON.stringify({ time: new Date().toISOString(), ...entry });
+    if (!logPath) { console.log(line); return; }
+    try {
+      if (existsSync(logPath) && statSync(logPath).size >= 2 * 1024 * 1024) {
+        renameSync(logPath, logPath.replace(/\.log$/, '') + '.previous.log');
+      }
+      appendFileSync(logPath, line + '\n', { mode: 0o600 });
+    } catch {
+      console.log(JSON.stringify({ event: 'log_write_error', message: 'Cannot write the service log.' }));
+    }
+  };
   try {
-    const config = JSON.parse(readFileSync(process.env.COPILOT_PROXY_CONFIG, 'utf8'));
-    const localToken = process.env.COPILOT_PROXY_LOCAL_TOKEN;
+    const { loadRuntimeConfiguration } = await import('./runtime.mjs');
+    const { config, localToken } = await loadRuntimeConfiguration();
     delete process.env.COPILOT_PROXY_LOCAL_TOKEN;
-    if (!Number.isInteger(config.port) || config.port < 1024 || config.port > 65535) throw new Error('Invalid port');
+    logPath = config.logPath;
     const server = createProxy({ localToken, getProviderToken: githubTokenSource(config.ghPath, { log }), log });
     server.on('error', error => {
       log({ event: 'server_error', code: error.code || 'startup_error' });
@@ -602,7 +616,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
       });
     }
   } catch {
-    log({ event: 'startup_error', message: 'Missing or invalid installation configuration/local key. Run install.ps1.' });
+    delete process.env.COPILOT_PROXY_LOCAL_TOKEN;
+    log({ event: 'startup_error', message: 'Missing or invalid installation configuration/local key. Run node manage.mjs install.' });
     process.exitCode = 1;
   }
 }
