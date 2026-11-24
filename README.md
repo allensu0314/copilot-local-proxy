@@ -7,6 +7,17 @@ Copilot licensing, model access, organization policies, and usage limits still
 apply. The Copilot endpoint is not a guaranteed public third-party API and may
 change.
 
+## Set up with a coding agent
+
+Paste this into an agent running on the computer where you use Codex:
+
+```text
+Set up the local Copilot proxy for me using https://github.com/allensu0314/copilot-local-proxy. Follow AGENTS.md, use the dedicated Codex CLI profile, and verify it with a real request.
+```
+
+For Codex desktop, replace “use the dedicated Codex CLI profile” with “make it
+the default for new local Codex desktop chats.” [Agent setup guide](AGENTS.md)
+
 ## Windows, Linux, and macOS
 
 The HTTP service runs on all three platforms with Node 22+ and a stored GitHub
